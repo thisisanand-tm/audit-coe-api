@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import psycopg
 from psycopg import sql
@@ -10,10 +10,23 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 app = FastAPI(title="Audit CoE API")
 
-# CORS locked to your Vercel frontend
+# CORS:
+# - Vercel production frontend
+# - Local development (Create React App default port 3000)
+# - Optional common dev ports (5173/4173) if you ever switch tooling
+ALLOWED_ORIGINS = [
+    "https://audit-coe-poc.vercel.app",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://audit-coe-poc.vercel.app"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -27,7 +40,6 @@ def _db() -> psycopg.Connection:
 
 
 def _table_columns(conn: psycopg.Connection, table: str, schema: str = "public") -> List[str]:
-    """Return column names for a table (lowercase), using information_schema."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -42,7 +54,8 @@ def _table_columns(conn: psycopg.Connection, table: str, schema: str = "public")
 
 
 def _select_intersection(existing: List[str], desired: List[str]) -> List[str]:
-    return [c for c in desired if c in set(existing)]
+    existing_set = set(existing)
+    return [c for c in desired if c in existing_set]
 
 
 @app.get("/health")
@@ -70,7 +83,6 @@ def debug_columns(
     table: str = Query(..., description="Table name (e.g., tasks, audit_runs)"),
     schema: str = Query(default="public", description="Schema name (default: public)"),
 ) -> Dict[str, Any]:
-    """Quickly inspect which columns exist (helps align API queries to the real schema)."""
     try:
         with _db() as conn:
             cols = _table_columns(conn, table=table, schema=schema)
@@ -84,10 +96,6 @@ def list_audit_runs(
     account_id: Optional[str] = Query(default=None, description="Filter by account UUID"),
     limit: int = Query(default=50, ge=1, le=500),
 ) -> Dict[str, Any]:
-    """
-    Returns audit runs. Uses a conservative set of fields, but adapts to your real schema by
-    selecting only columns that actually exist.
-    """
     desired = ["id", "account_id", "template_id", "status", "started_at", "due_at", "created_at"]
     try:
         with _db() as conn:
@@ -96,10 +104,8 @@ def list_audit_runs(
             if not select_cols:
                 return {"error": "audit_runs_no_known_columns", "detail": f"Found columns: {cols}"}
 
-            # Build SELECT list safely
             select_sql = sql.SQL(", ").join(sql.Identifier(c) for c in select_cols)
 
-            # WHERE clause (only if account_id column exists)
             where_parts = []
             params: Dict[str, Any] = {"limit": limit}
             if account_id and "account_id" in cols:
@@ -107,6 +113,8 @@ def list_audit_runs(
                 params["account_id"] = account_id
 
             where_sql = sql.SQL("WHERE ") + sql.SQL(" AND ").join(where_parts) if where_parts else sql.SQL("")
+
+            order_col = "created_at" if "created_at" in cols else select_cols[0]
 
             query = sql.SQL("""
                 SELECT {select_cols}
@@ -118,7 +126,7 @@ def list_audit_runs(
                 select_cols=select_sql,
                 table=sql.Identifier("audit_runs"),
                 where_clause=where_sql,
-                order_col=sql.Identifier("created_at") if "created_at" in cols else sql.Identifier(select_cols[0]),
+                order_col=sql.Identifier(order_col),
             )
 
             with conn.cursor() as cur:
@@ -138,11 +146,6 @@ def list_tasks(
     status: Optional[str] = Query(default=None, description="Filter by task status"),
     limit: int = Query(default=200, ge=1, le=1000),
 ) -> Dict[str, Any]:
-    """
-    Returns tasks. Your schema may not have tasks.account_id; if not, we can filter account_id
-    by joining tasks.audit_run_id -> audit_runs.id (if those columns exist).
-    Also selects only columns that exist in your tasks table.
-    """
     desired = [
         "id",
         "audit_run_id",
@@ -165,10 +168,10 @@ def list_tasks(
                 return {"error": "tasks_no_known_columns", "detail": f"Found columns: {task_cols}"}
 
             params: Dict[str, Any] = {"limit": limit}
-
             where_parts = []
+            join_sql = sql.SQL("")
+            from_sql = sql.SQL("{tasks} t").format(tasks=sql.Identifier("tasks"))
 
-            # Prefer filtering directly if tasks has the column
             if audit_run_id and "audit_run_id" in task_cols:
                 where_parts.append(sql.SQL("t.audit_run_id = %(audit_run_id)s"))
                 params["audit_run_id"] = audit_run_id
@@ -177,16 +180,11 @@ def list_tasks(
                 where_parts.append(sql.SQL("t.status = %(status)s"))
                 params["status"] = status
 
-            join_sql = sql.SQL("")
-            from_sql = sql.SQL("{tasks} t").format(tasks=sql.Identifier("tasks"))
-
-            # account_id filter: direct or via join to audit_runs
             if account_id:
                 if "account_id" in task_cols:
                     where_parts.append(sql.SQL("t.account_id = %(account_id)s"))
                     params["account_id"] = account_id
                 else:
-                    # Join only if we can: tasks.audit_run_id -> audit_runs.id and audit_runs.account_id exists
                     if "audit_run_id" in task_cols and "id" in run_cols and "account_id" in run_cols:
                         join_sql = sql.SQL("JOIN {runs} r ON r.id = t.audit_run_id").format(
                             runs=sql.Identifier("audit_runs")
@@ -203,7 +201,6 @@ def list_tasks(
 
             select_sql = sql.SQL(", ").join(sql.SQL("t.") + sql.Identifier(c) for c in select_cols)
             where_sql = sql.SQL("WHERE ") + sql.SQL(" AND ").join(where_parts) if where_parts else sql.SQL("")
-
             order_col = "created_at" if "created_at" in task_cols else select_cols[0]
 
             query = sql.SQL("""
